@@ -239,7 +239,7 @@ class BeautyBot:
             return
 
         if text in {"📋 Показать меню", "Показать меню"}:
-            self.show_home(user_id, self.panel_message_ids.get(user_id))
+            self.show_home(user_id)
             return
 
         if text in {"📚 Все записи", "Все записи"}:
