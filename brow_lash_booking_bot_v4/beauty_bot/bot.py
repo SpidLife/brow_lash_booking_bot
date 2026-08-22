@@ -89,6 +89,18 @@ class BeautyBot:
             rows.append(["⚙️ Управление расписанием"])
         return reply_keyboard(*rows)
 
+    def show_home(self, user_id: int) -> None:
+        self.db.clear_state(user_id)
+        profile = self.db.profile(user_id)
+        name = str(profile["full_name"]) if profile else "Клиент"
+        greeting = (
+            f"✨ <b>{escape(self.settings.studio_name)}</b>\n\n"
+            f"Привет, {escape(name)}! Я помогу выбрать процедуру и записаться "
+            f"к мастеру {escape(self.settings.master_name)} в удобное время.\n\n"
+            "Выбери действие ниже 👇"
+        )
+        self.api.send(user_id, greeting, self.main_keyboard(user_id))
+
     def safe_notify(self, user_id: int, text: str, keyboard: dict[str, Any] | None = None) -> None:
         try:
             self.api.send(user_id, text, keyboard)
@@ -159,15 +171,25 @@ class BeautyBot:
         self.db.save_profile(user_id, name, username)
         text = (message.get("text") or "").strip()
 
-        if text in {"/start", "/cancel", "🏠 Главное меню"}:
-            self.db.clear_state(user_id)
-            greeting = (
-                f"✨ <b>{escape(self.settings.studio_name)}</b>\n\n"
-                f"Привет, {escape(name)}! Я помогу выбрать процедуру и записаться "
-                f"к мастеру {escape(self.settings.master_name)} в удобное время.\n\n"
-                "Выбери действие ниже 👇"
-            )
-            self.api.send(user_id, greeting, self.main_keyboard(user_id))
+        if text in {"/start", "/cancel", "🏠 Главное меню", "← Назад", "↩️ Назад"}:
+            if text in {"← Назад", "↩️ Назад"}:
+                active_state = self.db.state(user_id)
+                if active_state and active_state["state"] == "await_phone":
+                    payload = json.loads(active_state["payload"])
+                    self.db.clear_state(user_id)
+                    self.api.send(user_id, "← Выбери другое время.", self.main_keyboard(user_id))
+                    self.show_times(
+                        user_id,
+                        int(payload["service_id"]),
+                        date.fromisoformat(payload["date"]),
+                        replace_id=payload.get("replace_id"),
+                    )
+                    return
+                if active_state and active_state["state"].startswith("admin_") and self.is_admin(user_id):
+                    self.db.clear_state(user_id)
+                    self.show_admin_panel(user_id)
+                    return
+            self.show_home(user_id)
             return
 
         if text in {"✨ Записаться", "/book"}:
@@ -196,10 +218,11 @@ class BeautyBot:
                 f"📸 <b>Instagram:</b> {self.instagram_link()}"
             )
             entrance_photo = self.db.studio_setting("entrance_photo_file_id")
+            back_keyboard = inline([("← Назад", "home")])
             if entrance_photo:
-                self.api.send_photo(user_id, entrance_photo, details, self.main_keyboard(user_id))
+                self.api.send_photo(user_id, entrance_photo, details, back_keyboard)
             else:
-                self.api.send(user_id, details, self.main_keyboard(user_id))
+                self.api.send(user_id, details, back_keyboard)
             return
         if text in {"⚙️ Управление расписанием", "/admin"}:
             if not self.is_admin(user_id):
@@ -242,7 +265,7 @@ class BeautyBot:
             user_id,
             "💬 Напиши свой вопрос следующим сообщением — я сразу передам его мастеру.\n\n"
             f"Также можно написать напрямую: {escape(self.settings.contact)}",
-            self.main_keyboard(user_id),
+            inline([("← Назад", "home")]),
         )
 
     def handle_state(self, message: dict[str, Any], state: str, payload: dict[str, Any]) -> None:
@@ -373,7 +396,7 @@ class BeautyBot:
         self.api.send(
             user_id,
             f"📸 Фото №{photo_id} добавлено. Можно отправить ещё одну фотографию.",
-            inline([("✅ Завершить добавление", "aportfolio")]),
+            inline([("✅ Завершить добавление", "aportfolio")], [("← Назад", "aportfolio")]),
         )
 
     def create_manual_booking(self, user_id: int, text: str, payload: dict[str, Any]) -> None:
@@ -423,7 +446,11 @@ class BeautyBot:
     def show_services(self, user_id: int, booking: bool, message_id: int | None = None) -> None:
         services = self.db.services()
         if not services:
-            self.api.send(user_id, "Сейчас запись временно недоступна. Напиши мастеру, чтобы уточнить ближайшее время.")
+            self.api.send(
+                user_id,
+                "Сейчас запись временно недоступна. Напиши мастеру, чтобы уточнить ближайшее время.",
+                inline([("← Назад", "home")]),
+            )
             return
         if booking:
             text = "✨ <b>Выбери процедуру</b>\n\nНажми на услугу — затем я покажу только подходящие свободные окна."
@@ -438,6 +465,7 @@ class BeautyBot:
                 )
             text = "\n".join(lines)
             rows = [[("✨ Выбрать время", "book")]]
+        rows.append([("← Назад", "home")])
         keyboard = inline(*rows)
         if message_id:
             self.api.edit(user_id, message_id, text, keyboard)
@@ -475,7 +503,7 @@ class BeautyBot:
                 "📸 Фотографии работ скоро появятся.\n\n"
                 f"✨ Ещё больше работ — {self.instagram_link('тут')}.\n\n"
                 "А пока можно посмотреть услуги и выбрать удобное время. 💛",
-                inline([("✨ Записаться", "book")]),
+                inline([("✨ Записаться", "book")], [("← Назад", "home")]),
             )
             return
         self.api.send(user_id, f"📸 <b>Работы мастера {escape(self.settings.master_name)}</b>")
@@ -485,7 +513,7 @@ class BeautyBot:
             user_id,
             f"✨ Ещё больше работ — {self.instagram_link('тут')}.\n\n"
             "Понравилась работа? Выбери удобное время 👇",
-            inline([("✨ Записаться", "book")]),
+            inline([("✨ Записаться", "book")], [("← Назад", "home")]),
         )
 
     def show_dates(self, user_id: int, service_id: int, page: int = 0, message_id: int | None = None, replace_id: int | None = None) -> None:
@@ -562,7 +590,11 @@ class BeautyBot:
                 user_id,
                 "📱 Чтобы мастер мог связаться с тобой, отправь номер телефона.\n\n"
                 "Нажми кнопку ниже или напиши номер вручную. Он понадобится только для записи.",
-                reply_keyboard([{"text": "📱 Поделиться номером", "request_contact": True}], ["🏠 Главное меню"], one_time=True),
+                reply_keyboard(
+                    [{"text": "📱 Поделиться номером", "request_contact": True}],
+                    ["← Назад", "🏠 Главное меню"],
+                    one_time=True,
+                ),
             )
             return
         self.show_confirmation(user_id, service_id, work_date, start, replace_id)
@@ -647,7 +679,11 @@ class BeautyBot:
     def show_my_bookings(self, user_id: int) -> None:
         bookings = self.db.customer_bookings(user_id, self.now().date())
         if not bookings:
-            self.api.send(user_id, "Пока активных записей нет. Выбери процедуру — я покажу свободные окна. 💛", inline([("✨ Записаться", "book")]))
+            self.api.send(
+                user_id,
+                "Пока активных записей нет. Выбери процедуру — я покажу свободные окна. 💛",
+                inline([("✨ Записаться", "book")], [("← Назад", "home")]),
+            )
             return
         self.api.send(user_id, "📋 <b>Твои ближайшие записи:</b>")
         for booking in bookings:
@@ -657,6 +693,7 @@ class BeautyBot:
                 inline(
                     [("🔄 Перенести", f"reschedule:{booking['id']}")],
                     [("❌ Отменить", f"cancelask:{booking['id']}")],
+                    [("← Назад", "home")],
                 ),
             )
 
@@ -682,6 +719,7 @@ class BeautyBot:
             [("📸 Фотографии работ", "aportfolio")],
             [("📍 Адрес и фото входа", "aaddress")],
             [("📊 Сводка на сегодня", "adigest:0"), ("📊 На завтра", "adigest:1")],
+            [("← Назад", "home")],
         )
         if message_id:
             self.api.edit(user_id, message_id, text, keyboard)
@@ -1051,7 +1089,13 @@ class BeautyBot:
             return
 
         try:
-            if action == "book":
+            if action == "home":
+                self.show_home(user_id)
+            elif action == "appointments":
+                self.db.clear_state(user_id)
+                self.show_my_bookings(user_id)
+            elif action == "book":
+                self.db.clear_state(user_id)
                 self.show_services(user_id, True, message_id)
             elif action == "svc":
                 self.show_service_card(user_id, int(parts[1]), message_id)
@@ -1084,7 +1128,14 @@ class BeautyBot:
                     if not self.can_customer_cancel(booking):
                         self.api.send(user_id, f"До процедуры осталось меньше {self.settings.cancellation_notice_hours} ч. Для отмены напиши мастеру: {escape(self.settings.contact)}")
                     else:
-                        self.api.send(user_id, "Точно отменить запись?", inline([("Да, отменить", f"cancelok:{booking['id']}"), ("Оставить", "keep")]))
+                        self.api.send(
+                            user_id,
+                            "Точно отменить запись?",
+                            inline(
+                                [("Да, отменить", f"cancelok:{booking['id']}"), ("Оставить", "keep")],
+                                [("← Назад", "appointments")],
+                            ),
+                        )
             elif action == "cancelok":
                 booking = self.db.booking(int(parts[1]))
                 if booking and int(booking["telegram_user_id"]) == user_id and self.can_customer_cancel(booking) and self.db.cancel_booking(int(parts[1]), user_id):
@@ -1115,6 +1166,8 @@ class BeautyBot:
         if not self.is_admin(user_id):
             return
         action = parts[0]
+        if action in {"admin", "aweek", "aday", "asvc", "aservices", "aportfolio", "aaddress", "amday", "amanual"}:
+            self.db.clear_state(user_id)
         if action == "admin":
             self.show_admin_panel(user_id, message_id)
         elif action == "abook":
@@ -1130,7 +1183,11 @@ class BeautyBot:
         elif action == "adigest":
             offset = int(parts[1])
             label = "Сегодня" if offset == 0 else "Завтра"
-            self.api.send(user_id, self.daily_summary(self.now().date() + timedelta(days=offset), label))
+            self.api.send(
+                user_id,
+                self.daily_summary(self.now().date() + timedelta(days=offset), label),
+                inline([("← Назад", "admin")]),
+            )
         elif action == "amanual":
             self.show_manual_services(user_id, message_id=message_id)
         elif action == "amanualday":
@@ -1160,6 +1217,7 @@ class BeautyBot:
                 "Можно добавить Telegram третьим полем:\n"
                 "<code>Анна; +79991234567; @anna</code>\n\n"
                 "Для отмены — /cancel",
+                inline([("← Назад", f"amday:{int(parts[1])}:{parts[2]}")]),
             )
         elif action == "acal":
             self.show_admin_calendar(user_id, int(parts[1]), message_id)
@@ -1180,7 +1238,12 @@ class BeautyBot:
             )
         elif action == "awhours":
             self.db.set_state(user_id, "admin_weekday_hours", json.dumps({"weekday": int(parts[1])}))
-            self.api.send(user_id, f"Напиши рабочие часы для дня «{WEEKDAYS[int(parts[1])] }».\n\nНапример: <b>10:00-19:30</b>\n\nДля отмены — /cancel")
+            self.api.send(
+                user_id,
+                f"Напиши рабочие часы для дня «{WEEKDAYS[int(parts[1])] }».\n\n"
+                "Например: <b>10:00-19:30</b>\n\nДля отмены — /cancel",
+                inline([("← Назад", "aweek")]),
+            )
         elif action == "awoff":
             existing = self.db.weekly_schedule()[int(parts[1])]
             self.db.set_weekday(int(parts[1]), False, int(existing["start_minutes"]), int(existing["end_minutes"]))
@@ -1191,7 +1254,12 @@ class BeautyBot:
             state = "admin_day_hours" if action == "ahours" else "admin_block_hours"
             self.db.set_state(user_id, state, json.dumps({"date": work_date.isoformat()}))
             hint = "рабочие часы" if action == "ahours" else "интервал, который нужно закрыть"
-            self.api.send(user_id, f"Напиши {hint} для {pretty_date(work_date)}.\n\nНапример: <b>10:00-18:30</b>\n\nДля отмены — /cancel")
+            self.api.send(
+                user_id,
+                f"Напиши {hint} для {pretty_date(work_date)}.\n\n"
+                "Например: <b>10:00-18:30</b>\n\nДля отмены — /cancel",
+                inline([("← Назад", f"aday:{parts[1]}")]),
+            )
         elif action == "aoff":
             work_date = self.decode_date(parts[1])
             if self.db.day_bookings(work_date):
@@ -1223,13 +1291,22 @@ class BeautyBot:
             if field not in prompts:
                 raise ValueError("Неизвестный параметр услуги")
             self.db.set_state(user_id, "admin_edit_service", json.dumps({"service_id": service_id, "field": field}))
-            self.api.send(user_id, f"{prompts[field]}\n\nДля отмены — /cancel")
+            self.api.send(
+                user_id,
+                f"{prompts[field]}\n\nДля отмены — /cancel",
+                inline([("← Назад", f"asvc:{service_id}")]),
+            )
         elif action == "atoggle":
             self.db.toggle_service(int(parts[1]))
             self.show_admin_service(user_id, int(parts[1]))
         elif action == "aaddservice":
             self.db.set_state(user_id, "admin_add_service")
-            self.api.send(user_id, "Отправь услугу в формате:\n\n<b>Название; минуты; цена</b>\n\nНапример:\n<code>Ламинирование ресниц; 90; 2500</code>\n\nДля отмены — /cancel")
+            self.api.send(
+                user_id,
+                "Отправь услугу в формате:\n\n<b>Название; минуты; цена</b>\n\n"
+                "Например:\n<code>Ламинирование ресниц; 90; 2500</code>\n\nДля отмены — /cancel",
+                inline([("← Назад", "aservices")]),
+            )
         elif action == "aportfolio":
             self.show_admin_portfolio(user_id, message_id)
         elif action == "aaddress":
@@ -1241,6 +1318,7 @@ class BeautyBot:
                 "📍 Отправь новый адрес студии одним сообщением.\n\n"
                 "Например: <code>Университетская улица, 25/2, вход со стороны двора</code>\n\n"
                 "Для отмены — /cancel",
+                inline([("← Назад", "aaddress")]),
             )
         elif action == "aaddressphoto":
             self.db.set_state(user_id, "admin_entrance_photo")
@@ -1248,6 +1326,7 @@ class BeautyBot:
                 user_id,
                 "📸 Отправь фотографию входа в студию обычным сообщением. "
                 "Клиенты увидят её вместе с адресом.\n\nДля отмены — /cancel",
+                inline([("← Назад", "aaddress")]),
             )
         elif action == "aaddressclear":
             self.db.set_studio_setting("entrance_photo_file_id", "")
@@ -1259,6 +1338,7 @@ class BeautyBot:
                 user_id,
                 "📸 Отправь одну или несколько фотографий работ. При желании добавь подпись к фото.\n\n"
                 "Каждая фотография появится в разделе «Фото работ». Для завершения нажми кнопку под сообщением или отправь /cancel.",
+                inline([("← Назад", "aportfolio")]),
             )
         elif action == "adelphoto":
             if self.db.delete_portfolio_photo(int(parts[1])):
@@ -1328,3 +1408,4 @@ class BeautyBot:
                 self.db.mark_notification_sent(key, now)
             except TelegramAPIError:
                 logger.warning("Не удалось отправить сводку администратору %s", admin_id, exc_info=True)
+                
