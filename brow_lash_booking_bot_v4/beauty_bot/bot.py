@@ -9,9 +9,14 @@ from html import escape
 from typing import Any
 from urllib.parse import urlparse
 
-from .config import Settings
-from .db import Database, hhmm_to_minutes, minutes_to_hhmm
-from .telegram import TelegramAPI, TelegramAPIError, inline, reply_keyboard
+if __package__:
+    from .config import Settings
+    from .db import Database, hhmm_to_minutes, minutes_to_hhmm
+    from .telegram import TelegramAPI, TelegramAPIError, inline, reply_keyboard
+else:
+    from config import Settings
+    from db import Database, hhmm_to_minutes, minutes_to_hhmm
+    from telegram import TelegramAPI, TelegramAPIError, inline, reply_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -1409,3 +1414,5 @@ class BeautyBot:
             except TelegramAPIError:
                 logger.warning("Не удалось отправить сводку администратору %s", admin_id, exc_info=True)
                 
+if __name__ == "__main__":
+    BeautyBot(Settings.from_env()).run()
