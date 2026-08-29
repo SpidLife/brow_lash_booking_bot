@@ -6,6 +6,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_STUDIO_ADDRESS = "Университетская улица, 25/2, вход со стороны двора"
+DEFAULT_STUDIO_MAP_URL = (
+    "https://2gis.ru/surgut/geo/5489397701018108/73.431258%2C61.251471"
+    "?m=73.431625%2C61.251405%2F18.35%2Fp%2F2.07%2Fr%2F17.12"
+)
 DEFAULT_MASTER_CONTACT = "@Kksdaun"
 DEFAULT_INSTAGRAM_URL = "https://www.instagram.com/kksdaun/"
 LEGACY_ADDRESS_PLACEHOLDERS = frozenset({
@@ -47,6 +51,7 @@ class Settings:
     morning_summary_hour: int = 9
     evening_summary_hour: int = 20
     instagram_url: str = DEFAULT_INSTAGRAM_URL
+    map_url: str = DEFAULT_STUDIO_MAP_URL
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -93,6 +98,7 @@ class Settings:
             morning_summary_hour=int(os.getenv("MORNING_SUMMARY_HOUR", "9")),
             evening_summary_hour=int(os.getenv("EVENING_SUMMARY_HOUR", "20")),
             instagram_url=os.getenv("STUDIO_INSTAGRAM", DEFAULT_INSTAGRAM_URL).strip() or DEFAULT_INSTAGRAM_URL,
+            map_url=os.getenv("STUDIO_MAP_URL", DEFAULT_STUDIO_MAP_URL).strip() or DEFAULT_STUDIO_MAP_URL,
         )
         if not 1 <= settings.booking_horizon_days <= 90:
             raise ValueError("BOOKING_HORIZON_DAYS должен быть в диапазоне 1–90.")
