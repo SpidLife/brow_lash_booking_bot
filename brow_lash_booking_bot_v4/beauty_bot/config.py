@@ -52,6 +52,7 @@ class Settings:
     evening_summary_hour: int = 20
     instagram_url: str = DEFAULT_INSTAGRAM_URL
     map_url: str = DEFAULT_STUDIO_MAP_URL
+    bot_manager_ids: frozenset[int] = frozenset()
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -68,6 +69,14 @@ class Settings:
         if not admins:
             raise ValueError("Укажи хотя бы один Telegram ID администратора в ADMIN_IDS.")
 
+        raw_managers = os.getenv("BOT_MANAGER_IDS", "").strip()
+        try:
+            bot_managers = frozenset(
+                int(item.strip()) for item in raw_managers.split(",") if item.strip()
+            )
+        except ValueError as exc:
+            raise ValueError("BOT_MANAGER_IDS должен содержать Telegram ID через запятую.") from exc
+
         timezone_name = os.getenv("TIMEZONE", "Asia/Yekaterinburg").strip()
         try:
             timezone = ZoneInfo(timezone_name)
@@ -81,10 +90,14 @@ class Settings:
         if not contact or contact == "@your_username":
             contact = DEFAULT_MASTER_CONTACT
 
+        studio_name = os.getenv("STUDIO_NAME", "Brows & Lashes").strip()
+        if not studio_name or studio_name == "Brow & Lash Studio":
+            studio_name = "Brows & Lashes"
+
         settings = cls(
             bot_token=token,
             admin_ids=admins,
-            studio_name=os.getenv("STUDIO_NAME", "Brow & Lash Studio").strip(),
+            studio_name=studio_name,
             master_name=os.getenv("MASTER_NAME", "Ксюша").strip(),
             address=address,
             contact=contact,
@@ -99,6 +112,7 @@ class Settings:
             evening_summary_hour=int(os.getenv("EVENING_SUMMARY_HOUR", "20")),
             instagram_url=os.getenv("STUDIO_INSTAGRAM", DEFAULT_INSTAGRAM_URL).strip() or DEFAULT_INSTAGRAM_URL,
             map_url=os.getenv("STUDIO_MAP_URL", DEFAULT_STUDIO_MAP_URL).strip() or DEFAULT_STUDIO_MAP_URL,
+            bot_manager_ids=bot_managers,
         )
         if not 1 <= settings.booking_horizon_days <= 90:
             raise ValueError("BOOKING_HORIZON_DAYS должен быть в диапазоне 1–90.")
