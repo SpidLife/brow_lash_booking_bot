@@ -1168,6 +1168,7 @@ class BeautyBot:
             [("📝 Описание", f"aedit:{service_id}:description")],
             [("📸 Добавить / заменить фото", f"aedit:{service_id}:photo_file_id")],
             [("🙈 Скрыть" if service["active"] else "👁 Показать", f"atoggle:{service_id}")],
+            [("🗑 Удалить", f"adelservice:{service_id}")],
             [("← Ко всем услугам", "aservices")],
         )
         if message_id:
@@ -1661,7 +1662,36 @@ class BeautyBot:
             )
         elif action == "atoggle":
             self.db.toggle_service(int(parts[1]))
-            self.show_admin_service(user_id, int(parts[1]))
+            self.show_admin_service(user_id, int(parts[1]), message_id)
+        elif action == "adelservice":
+            service_id = int(parts[1])
+            service = self.db.service(service_id, active_only=False)
+            if not service:
+                self.show_admin_services(user_id, message_id)
+            else:
+                self.show_panel(
+                    user_id,
+                    f"🗑 <b>Удалить услугу?</b>\n\n"
+                    f"{escape(service['name'])}\n\n"
+                    "Она исчезнет из меню клиенток и из списка услуг. "
+                    "Уже созданные записи и история выручки сохранятся.",
+                    inline(
+                        [("Да, удалить", f"adelserviceok:{service_id}")],
+                        [("← Не удалять", f"asvc:{service_id}")],
+                    ),
+                    message_id,
+                )
+        elif action == "adelserviceok":
+            service_id = int(parts[1])
+            if self.db.delete_service(service_id):
+                self.show_panel(
+                    user_id,
+                    "✅ Услуга удалена. Старые записи клиентов сохранены.",
+                    inline([("← Ко всем услугам", "aservices")]),
+                    message_id,
+                )
+            else:
+                self.show_admin_services(user_id, message_id)
         elif action == "aaddservice":
             self.db.set_state(user_id, "admin_add_service")
             self.show_panel(
