@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import logging
 import re
 import time as time_module
@@ -40,6 +42,10 @@ WEEKDAYS = ("Понедельник", "Вторник", "Среда", "Четв�
 WEEKDAYS_SHORT = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 MONTHS_GENITIVE = (
     "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"
+)
+MONTHS_NOMINATIVE = (
+    "январь", "февраль", "март", "апрель", "май", "июнь",
+    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
 )
 ATTENDANCE_LABELS = {
     "pending": "🕒 Ожидает подтверждения",
@@ -98,6 +104,28 @@ class BeautyBot:
     def can_manage_bot(self, user_id: int) -> bool:
         return self.is_admin(user_id) or user_id in self.settings.bot_manager_ids
 
+    def analytics_user_hash(self, user_id: int) -> str:
+        return hmac.new(
+            self.db.analytics_secret().encode("ascii"),
+            str(user_id).encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def record_client_analytics(
+        self,
+        user_id: int,
+        event: str,
+        known_before_tracking: bool = False,
+    ) -> None:
+        if self.is_admin(user_id) or user_id in self.settings.bot_manager_ids:
+            return
+        self.db.record_analytics_event(
+            self.analytics_user_hash(user_id),
+            event,
+            self.now(),
+            known_before_tracking,
+        )
+
     @property
     def client_minimum_notice_minutes(self) -> int:
         return max(120, self.settings.minimum_notice_minutes)
@@ -130,9 +158,13 @@ class BeautyBot:
             return reply_keyboard(
                 ["📋 Показать меню", "✏️ Изменить"],
                 ["📚 Все записи", "⚙️ Настройки бота"],
+                ["📈 Статистика"],
             )
         if self.can_manage_bot(user_id):
-            return reply_keyboard(["📋 Показать меню", "⚙️ Настройки бота"])
+            return reply_keyboard(
+                ["📋 Показать меню", "⚙️ Настройки бота"],
+                ["📈 Статистика"],
+            )
         return reply_keyboard(["📋 Показать меню"])
 
     def home_keyboard(self, user_id: int) -> dict[str, Any]:
@@ -255,6 +287,7 @@ class BeautyBot:
                     commands=[
                         {"command": "start", "description": "Открыть главное меню"},
                         {"command": "admin", "description": "Управление для мастера"},
+                        {"command": "stats", "description": "Статистика посещений"},
                         {"command": "cancel", "description": "Отменить текущий ввод"},
                     ],
                 )
@@ -266,6 +299,7 @@ class BeautyBot:
                     commands=[
                         {"command": "start", "description": "Открыть главное меню"},
                         {"command": "botsettings", "description": "Настройки профиля бота"},
+                        {"command": "stats", "description": "Статистика посещений"},
                         {"command": "cancel", "description": "Отменить текущий ввод"},
                     ],
                 )
@@ -288,6 +322,8 @@ class BeautyBot:
         chat = message.get("chat", {})
         if user_id <= 0 or chat.get("type") != "private":
             return
+        known_before_tracking = self.db.profile(user_id) is not None
+        self.record_client_analytics(user_id, "launch", known_before_tracking)
         name = " ".join(part for part in (user.get("first_name", ""), user.get("last_name", "")) if part).strip() or "Клиент"
         username = user.get("username", "")
         self.db.save_profile(user_id, name, username)
@@ -299,6 +335,8 @@ class BeautyBot:
             start_parts = text.split(maxsplit=1)
             if len(start_parts) == 2 and start_parts[1].startswith("ref_"):
                 referral_result = self.db.register_referral_code(start_parts[1][4:], user_id, self.now())
+                if referral_result == "registered":
+                    self.record_client_analytics(user_id, "referral")
             self.configure_chat_commands(user_id)
             ready_text = "✨ Панель готова. Пользуйся кнопками внизу 👇"
             if referral_result == "registered":
@@ -387,6 +425,13 @@ class BeautyBot:
                 return
             self.db.clear_state(user_id)
             self.show_bot_settings(user_id)
+            return
+        if text in {"📈 Статистика", "/stats"}:
+            if not self.can_manage_bot(user_id):
+                self.api.send(user_id, "Статистика доступна только мастеру или управляющему ботом.", self.main_keyboard(user_id))
+                return
+            self.db.clear_state(user_id)
+            self.show_admin_stats(user_id)
             return
         if text in {"✏️ Изменить", "Изменить", "⚙️ Управление расписанием", "/admin"}:
             if not self.is_admin(user_id):
@@ -993,6 +1038,8 @@ class BeautyBot:
             return
         booking = self.db.booking(result.booking_id)
         assert booking is not None
+        if replace_id is None:
+            self.record_client_analytics(user_id, "booking")
         action = "перенесена" if replace_id is not None else "подтверждена"
         self.api.send(
             user_id,
@@ -1087,6 +1134,7 @@ class BeautyBot:
             [("🎁 Реферальная программа", "areferrals")],
             [("📸 Фотографии работ", "aportfolio")],
             [("📍 Адрес и фото входа", "aaddress")],
+            [("📈 Статистика посещений", "astats:month")],
             [("📊 Сводка на сегодня", "adigest:0"), ("📊 На завтра", "adigest:1")],
             [("← Назад", "home")],
         )
@@ -1097,6 +1145,79 @@ class BeautyBot:
             sent = self.api.send(user_id, text, keyboard)
             if sent.get("message_id"):
                 self.panel_message_ids[user_id] = int(sent["message_id"])
+
+    @staticmethod
+    def next_month(value: date) -> date:
+        return (value.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+    def show_admin_stats(
+        self,
+        user_id: int,
+        period: str = "month",
+        month_value: str | None = None,
+        message_id: int | None = None,
+    ) -> None:
+        today = self.now().date()
+        current_month = today.replace(day=1)
+        if period == "today":
+            start_date = today
+            end_date = today + timedelta(days=1)
+            heading = f"📊 <b>Статистика за {today.day} {MONTHS_GENITIVE[today.month - 1]}</b>"
+            viewed_month = current_month
+        else:
+            viewed_month = (
+                datetime.strptime(month_value, "%Y%m").date().replace(day=1)
+                if month_value
+                else current_month
+            )
+            start_date = viewed_month
+            end_date = self.next_month(viewed_month)
+            heading = (
+                f"📊 <b>Статистика за {MONTHS_NOMINATIVE[viewed_month.month - 1]} "
+                f"{viewed_month.year}</b>"
+            )
+        stats = self.db.analytics_stats(start_date, end_date)
+        tracking_since = stats["tracking_since"]
+        tracking_note = (
+            f"\n\nℹ️ Учёт посещений ведётся с {pretty_date(date.fromisoformat(str(tracking_since)))}."
+            if tracking_since
+            else "\n\nℹ️ Посещений после включения статистики пока не было."
+        )
+        text = (
+            f"{heading}\n\n"
+            f"Запустили бота: <b>{stats['visitors']}</b>\n"
+            f"Новые пользователи: <b>{stats['new_users']}</b>\n"
+            f"Повторные: <b>{stats['returning_users']}</b>\n"
+            f"Записались: <b>{stats['booked']}</b>\n"
+            f"Конверсия в запись: <b>{stats['conversion']}%</b>\n"
+            f"По приглашению: <b>{stats['referred']}</b>"
+            f"{tracking_note}\n\n"
+            "Учитываются уникальные клиентские аккаунты, которые нажали /start или любую кнопку бота. "
+            "Имена, телефоны и список посетителей в статистике не сохраняются."
+        )
+        rows: list[list[tuple[str, str]]] = [
+            [("Сегодня", "astats:today"), ("Этот месяц", "astats:month")],
+        ]
+        if period == "month":
+            navigation: list[tuple[str, str]] = []
+            previous_month = (viewed_month - timedelta(days=1)).replace(day=1)
+            tracking_month = (
+                date.fromisoformat(str(tracking_since)).replace(day=1)
+                if tracking_since
+                else current_month
+            )
+            if viewed_month > tracking_month:
+                navigation.append(("‹ Раньше", f"astats:month:{previous_month.strftime('%Y%m')}"))
+            if viewed_month < current_month:
+                navigation.append(("Позже ›", f"astats:month:{self.next_month(viewed_month).strftime('%Y%m')}"))
+            if navigation:
+                rows.append(navigation)
+        rows.append([
+            ("← В панель мастера", "admin")
+            if self.is_admin(user_id)
+            else ("← В главное меню", "home")
+        ])
+        self.show_panel(user_id, text, inline(*rows), message_id)
 
     def show_bot_settings(self, user_id: int, message_id: int | None = None) -> None:
         if not self.can_manage_bot(user_id):
@@ -1719,6 +1840,11 @@ class BeautyBot:
 
     def handle_callback(self, query: dict[str, Any]) -> None:
         user_id = int(query["from"]["id"])
+        self.record_client_analytics(
+            user_id,
+            "launch",
+            self.db.profile(user_id) is not None,
+        )
         data = query.get("data", "")
         message = query.get("message", {})
         message_id = message.get("message_id")
@@ -1728,7 +1854,10 @@ class BeautyBot:
 
         parts = data.split(":")
         action = parts[0]
-        if action.startswith("a") and action not in {"appointments", "address"} and not self.is_admin(user_id):
+        if action == "astats" and not self.can_manage_bot(user_id):
+            self.api.send(user_id, "Статистика доступна только мастеру или управляющему ботом.")
+            return
+        if action.startswith("a") and action not in {"appointments", "address", "astats"} and not self.is_admin(user_id):
             self.api.send(user_id, "Управление расписанием доступно только мастеру.")
             return
         if action in {"bsettings", "bset", "bphotoclearask", "bphotoclear"} and not self.can_manage_bot(user_id):
@@ -1741,6 +1870,15 @@ class BeautyBot:
             elif action == "bsettings":
                 self.db.clear_state(user_id)
                 self.show_bot_settings(user_id, message_id)
+            elif action == "astats":
+                self.db.clear_state(user_id)
+                period = parts[1] if len(parts) > 1 else "month"
+                self.show_admin_stats(
+                    user_id,
+                    period,
+                    parts[2] if len(parts) > 2 else None,
+                    message_id,
+                )
             elif action == "bset":
                 field = parts[1]
                 prompts = {
