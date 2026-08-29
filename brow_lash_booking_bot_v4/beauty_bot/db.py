@@ -78,6 +78,7 @@ class Database:
                     duration_minutes INTEGER NOT NULL CHECK(duration_minutes BETWEEN 5 AND 1440),
                     price INTEGER NOT NULL CHECK(price >= 0),
                     active INTEGER NOT NULL DEFAULT 1,
+                    deleted INTEGER NOT NULL DEFAULT 0,
                     description TEXT NOT NULL DEFAULT '',
                     photo_file_id TEXT NOT NULL DEFAULT ''
                 );
@@ -171,6 +172,8 @@ class Database:
             conn.execute("ALTER TABLE services ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         if "photo_file_id" not in service_columns:
             conn.execute("ALTER TABLE services ADD COLUMN photo_file_id TEXT NOT NULL DEFAULT ''")
+        if "deleted" not in service_columns:
+            conn.execute("ALTER TABLE services ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
 
         booking_columns = {row["name"] for row in conn.execute("PRAGMA table_info(bookings)")}
         if "attendance_status" not in booking_columns:
@@ -179,12 +182,13 @@ class Database:
             conn.execute("ALTER TABLE bookings ADD COLUMN source TEXT NOT NULL DEFAULT 'telegram'")
 
     def services(self, include_inactive: bool = False) -> list[sqlite3.Row]:
-        sql = "SELECT * FROM services" + ("" if include_inactive else " WHERE active = 1") + " ORDER BY id"
+        clause = " WHERE deleted = 0" if include_inactive else " WHERE active = 1 AND deleted = 0"
+        sql = "SELECT * FROM services" + clause + " ORDER BY id"
         with self.connect() as conn:
             return list(conn.execute(sql))
 
     def service(self, service_id: int, active_only: bool = True) -> sqlite3.Row | None:
-        clause = " AND active = 1" if active_only else ""
+        clause = " AND active = 1 AND deleted = 0" if active_only else " AND deleted = 0"
         with self.connect() as conn:
             return conn.execute(f"SELECT * FROM services WHERE id = ?{clause}", (service_id,)).fetchone()
 
@@ -200,7 +204,16 @@ class Database:
 
     def toggle_service(self, service_id: int) -> None:
         with self.connect() as conn:
-            conn.execute("UPDATE services SET active = 1 - active WHERE id = ?", (service_id,))
+            conn.execute("UPDATE services SET active = 1 - active WHERE id = ? AND deleted = 0", (service_id,))
+
+    def delete_service(self, service_id: int) -> bool:
+        """Hide a service permanently while preserving historical booking rows."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE services SET active = 0, deleted = 1 WHERE id = ? AND deleted = 0",
+                (service_id,),
+            )
+            return cursor.rowcount > 0
 
     def update_service(self, service_id: int, field: str, value: str | int) -> bool:
         allowed_fields = {"name", "duration_minutes", "price", "description", "photo_file_id"}
@@ -221,7 +234,10 @@ class Database:
         else:
             value = str(value).strip()
         with self.connect() as conn:
-            cursor = conn.execute(f"UPDATE services SET {field} = ? WHERE id = ?", (value, service_id))
+            cursor = conn.execute(
+                f"UPDATE services SET {field} = ? WHERE id = ? AND deleted = 0",
+                (value, service_id),
+            )
             return cursor.rowcount > 0
 
     def add_portfolio_photo(self, file_id: str, caption: str, created_at: datetime) -> int:
@@ -402,7 +418,10 @@ class Database:
             raise ValueError("Неизвестный источник записи.")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            service = conn.execute("SELECT * FROM services WHERE id = ? AND active = 1", (service_id,)).fetchone()
+            service = conn.execute(
+                "SELECT * FROM services WHERE id = ? AND active = 1 AND deleted = 0",
+                (service_id,),
+            ).fetchone()
             if not service:
                 return BookingResult(False, reason="service_unavailable")
 
