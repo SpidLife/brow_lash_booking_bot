@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,6 +20,10 @@ DEFAULT_SERVICES = (
 
 ATTENDANCE_STATUSES = frozenset({"pending", "client_confirmed", "completed", "no_show"})
 BOOKING_STATUSES = frozenset({"confirmed", "cancelled", "rescheduled"})
+REFERRAL_PERCENT = 10
+REFERRAL_MAX_REWARD = 300
+BONUS_REDEMPTION_PERCENT = 40
+BONUS_EXPIRY_DAYS = 180
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +118,10 @@ class Database:
                     service_name TEXT NOT NULL,
                     duration_minutes INTEGER NOT NULL,
                     price INTEGER NOT NULL,
+                    base_price INTEGER NOT NULL DEFAULT 0,
+                    referral_discount INTEGER NOT NULL DEFAULT 0,
+                    bonus_used INTEGER NOT NULL DEFAULT 0,
+                    referral_id INTEGER,
                     work_date TEXT NOT NULL,
                     start_minutes INTEGER NOT NULL,
                     end_minutes INTEGER NOT NULL,
@@ -150,6 +159,47 @@ class Database:
                     setting_key TEXT PRIMARY KEY,
                     setting_value TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS referrals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    referrer_user_id INTEGER NOT NULL,
+                    referred_user_id INTEGER NOT NULL UNIQUE,
+                    first_booking_id INTEGER UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'registered',
+                    reward_amount INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    CHECK(referrer_user_id != referred_user_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_user_id, status);
+                CREATE TABLE IF NOT EXISTS referral_codes (
+                    telegram_user_id INTEGER PRIMARY KEY,
+                    code TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS bonus_rewards (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_user_id INTEGER NOT NULL,
+                    referral_id INTEGER NOT NULL UNIQUE REFERENCES referrals(id),
+                    amount INTEGER NOT NULL CHECK(amount > 0),
+                    remaining_amount INTEGER NOT NULL CHECK(remaining_amount >= 0),
+                    earned_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_bonus_rewards_user ON bonus_rewards(telegram_user_id, expires_at);
+                CREATE TABLE IF NOT EXISTS bonus_usages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    booking_id INTEGER NOT NULL UNIQUE REFERENCES bookings(id),
+                    telegram_user_id INTEGER NOT NULL,
+                    amount INTEGER NOT NULL CHECK(amount > 0),
+                    created_at TEXT NOT NULL,
+                    refunded_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS bonus_usage_items (
+                    usage_id INTEGER NOT NULL REFERENCES bonus_usages(id),
+                    reward_id INTEGER NOT NULL REFERENCES bonus_rewards(id),
+                    amount INTEGER NOT NULL CHECK(amount > 0),
+                    PRIMARY KEY(usage_id, reward_id)
+                );
                 """
             )
             self._migrate(conn)
@@ -180,6 +230,15 @@ class Database:
             conn.execute("ALTER TABLE bookings ADD COLUMN attendance_status TEXT NOT NULL DEFAULT 'pending'")
         if "source" not in booking_columns:
             conn.execute("ALTER TABLE bookings ADD COLUMN source TEXT NOT NULL DEFAULT 'telegram'")
+        if "base_price" not in booking_columns:
+            conn.execute("ALTER TABLE bookings ADD COLUMN base_price INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE bookings SET base_price = price WHERE base_price = 0")
+        if "referral_discount" not in booking_columns:
+            conn.execute("ALTER TABLE bookings ADD COLUMN referral_discount INTEGER NOT NULL DEFAULT 0")
+        if "bonus_used" not in booking_columns:
+            conn.execute("ALTER TABLE bookings ADD COLUMN bonus_used INTEGER NOT NULL DEFAULT 0")
+        if "referral_id" not in booking_columns:
+            conn.execute("ALTER TABLE bookings ADD COLUMN referral_id INTEGER")
 
     def services(self, include_inactive: bool = False) -> list[sqlite3.Row]:
         clause = " WHERE deleted = 0" if include_inactive else " WHERE active = 1 AND deleted = 0"
@@ -271,7 +330,7 @@ class Database:
         return str(row["setting_value"]) if row is not None else default
 
     def set_studio_setting(self, key: str, value: str) -> None:
-        if key not in {"address", "entrance_photo_file_id"}:
+        if key not in {"address", "entrance_photo_file_id", "referral_enabled"}:
             raise ValueError("Неизвестная настройка студии.")
         normalized = str(value).strip()
         if key == "address" and (not normalized or len(normalized) > 250):
@@ -399,6 +458,217 @@ class Database:
             candidate += step
         return slots
 
+    def referral_enabled(self) -> bool:
+        return self.studio_setting("referral_enabled", "1") != "0"
+
+    def set_referral_enabled(self, enabled: bool) -> None:
+        self.set_studio_setting("referral_enabled", "1" if enabled else "0")
+
+    def register_referral(self, referrer_user_id: int, referred_user_id: int, created_at: datetime) -> str:
+        if not self.referral_enabled():
+            return "disabled"
+        if referrer_user_id == referred_user_id:
+            return "self"
+        with self.connect() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM customer_profiles WHERE telegram_user_id = ?",
+                (referrer_user_id,),
+            ).fetchone():
+                return "invalid"
+            if conn.execute(
+                "SELECT 1 FROM bookings WHERE telegram_user_id = ? AND attendance_status = 'completed' LIMIT 1",
+                (referred_user_id,),
+            ).fetchone():
+                return "existing_customer"
+            if conn.execute("SELECT 1 FROM referrals WHERE referred_user_id = ?", (referred_user_id,)).fetchone():
+                return "already_registered"
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO referrals(referrer_user_id, referred_user_id, created_at) VALUES (?, ?, ?)",
+                (referrer_user_id, referred_user_id, created_at.isoformat()),
+            )
+            return "registered" if cursor.rowcount else "already_registered"
+
+    def referral_code(self, user_id: int, created_at: datetime) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT code FROM referral_codes WHERE telegram_user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row:
+                return str(row["code"])
+            if not conn.execute(
+                "SELECT 1 FROM customer_profiles WHERE telegram_user_id = ?",
+                (user_id,),
+            ).fetchone():
+                raise ValueError("Сначала открой главное меню бота.")
+            for _ in range(5):
+                code = secrets.token_urlsafe(8)
+                try:
+                    conn.execute(
+                        "INSERT INTO referral_codes(telegram_user_id, code, created_at) VALUES (?, ?, ?)",
+                        (user_id, code, created_at.isoformat()),
+                    )
+                    return code
+                except sqlite3.IntegrityError:
+                    continue
+            raise ValueError("Не удалось создать пригласительную ссылку.")
+
+    def register_referral_code(self, code: str, referred_user_id: int, created_at: datetime) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT telegram_user_id FROM referral_codes WHERE code = ?",
+                (code,),
+            ).fetchone()
+        if not row:
+            return "invalid"
+        return self.register_referral(int(row["telegram_user_id"]), referred_user_id, created_at)
+
+    def referral(self, referral_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM referrals WHERE id = ?", (referral_id,)).fetchone()
+
+    def referral_for_user(self, user_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM referrals WHERE referred_user_id = ?", (user_id,)).fetchone()
+
+    def referrals_by_referrer(self, user_id: int, limit: int = 20) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(conn.execute(
+                "SELECT r.*, p.full_name AS referred_name FROM referrals r "
+                "LEFT JOIN customer_profiles p ON p.telegram_user_id = r.referred_user_id "
+                "WHERE r.referrer_user_id = ? ORDER BY r.id DESC LIMIT ?",
+                (user_id, max(1, min(limit, 100))),
+            ))
+
+    def referral_discount_preview(self, user_id: int, base_price: int) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM referrals WHERE referred_user_id = ? AND status = 'registered' "
+                "AND first_booking_id IS NULL",
+                (user_id,),
+            ).fetchone()
+            profile = conn.execute(
+                "SELECT phone FROM customer_profiles WHERE telegram_user_id = ?",
+                (user_id,),
+            ).fetchone()
+            phone_used = bool(
+                profile
+                and profile["phone"]
+                and conn.execute(
+                    "SELECT 1 FROM bookings WHERE phone = ? AND attendance_status = 'completed' LIMIT 1",
+                    (profile["phone"],),
+                ).fetchone()
+            )
+        return min(base_price * REFERRAL_PERCENT // 100, REFERRAL_MAX_REWARD) if row and not phone_used else 0
+
+    @staticmethod
+    def _bonus_balance(conn: sqlite3.Connection, user_id: int, now: datetime) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(remaining_amount), 0) AS balance FROM bonus_rewards "
+            "WHERE telegram_user_id = ? AND remaining_amount > 0 AND expires_at > ?",
+            (user_id, now.isoformat()),
+        ).fetchone()
+        return int(row["balance"])
+
+    def bonus_balance(self, user_id: int, now: datetime) -> int:
+        with self.connect() as conn:
+            return self._bonus_balance(conn, user_id, now)
+
+    def bonus_redemption_preview(self, user_id: int, base_price: int, referral_discount: int, now: datetime) -> int:
+        if referral_discount:
+            return 0
+        limit = base_price * BONUS_REDEMPTION_PERCENT // 100
+        return min(self.bonus_balance(user_id, now), limit, max(0, base_price - referral_discount))
+
+    @staticmethod
+    def _consume_bonuses(
+        conn: sqlite3.Connection,
+        user_id: int,
+        booking_id: int,
+        amount: int,
+        now: datetime,
+    ) -> None:
+        if amount <= 0:
+            return
+        usage = conn.execute(
+            "INSERT INTO bonus_usages(booking_id, telegram_user_id, amount, created_at) VALUES (?, ?, ?, ?)",
+            (booking_id, user_id, amount, now.isoformat()),
+        )
+        usage_id = int(usage.lastrowid)
+        remaining = amount
+        rewards = conn.execute(
+            "SELECT * FROM bonus_rewards WHERE telegram_user_id = ? AND remaining_amount > 0 "
+            "AND expires_at > ? ORDER BY expires_at, id",
+            (user_id, now.isoformat()),
+        )
+        for reward in rewards:
+            taken = min(remaining, int(reward["remaining_amount"]))
+            if taken <= 0:
+                continue
+            conn.execute(
+                "UPDATE bonus_rewards SET remaining_amount = remaining_amount - ? WHERE id = ?",
+                (taken, reward["id"]),
+            )
+            conn.execute(
+                "INSERT INTO bonus_usage_items(usage_id, reward_id, amount) VALUES (?, ?, ?)",
+                (usage_id, reward["id"], taken),
+            )
+            remaining -= taken
+            if remaining == 0:
+                break
+        if remaining:
+            raise ValueError("Недостаточно доступных бонусов.")
+
+    @staticmethod
+    def _refund_bonuses(conn: sqlite3.Connection, booking_id: int, now: datetime) -> None:
+        usage = conn.execute(
+            "SELECT * FROM bonus_usages WHERE booking_id = ? AND refunded_at IS NULL",
+            (booking_id,),
+        ).fetchone()
+        if not usage:
+            return
+        items = conn.execute("SELECT * FROM bonus_usage_items WHERE usage_id = ?", (usage["id"],))
+        for item in items:
+            conn.execute(
+                "UPDATE bonus_rewards SET remaining_amount = remaining_amount + ? WHERE id = ?",
+                (item["amount"], item["reward_id"]),
+            )
+        conn.execute("UPDATE bonus_usages SET refunded_at = ? WHERE id = ?", (now.isoformat(), usage["id"]))
+
+    def referral_stats(self) -> dict[str, int]:
+        now = datetime.now().astimezone()
+        with self.connect() as conn:
+            referrals = conn.execute(
+                "SELECT COUNT(*) total, "
+                "COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) completed, "
+                "COALESCE(SUM(CASE WHEN status = 'ineligible' THEN 1 ELSE 0 END), 0) ineligible, "
+                "COALESCE(SUM(reward_amount), 0) rewards FROM referrals"
+            ).fetchone()
+            balance = conn.execute(
+                "SELECT COALESCE(SUM(remaining_amount), 0) balance FROM bonus_rewards WHERE expires_at > ?",
+                (now.isoformat(),),
+            ).fetchone()
+        ineligible = int(referrals["ineligible"])
+        return {
+            "total": int(referrals["total"]),
+            "completed": int(referrals["completed"]),
+            "pending": int(referrals["total"]) - int(referrals["completed"]) - ineligible,
+            "ineligible": ineligible,
+            "rewards": int(referrals["rewards"]),
+            "balance": int(balance["balance"]),
+        }
+
+    def recent_referrals(self, limit: int = 10) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(conn.execute(
+                "SELECT r.*, inviter.full_name referrer_name, friend.full_name referred_name "
+                "FROM referrals r "
+                "LEFT JOIN customer_profiles inviter ON inviter.telegram_user_id = r.referrer_user_id "
+                "LEFT JOIN customer_profiles friend ON friend.telegram_user_id = r.referred_user_id "
+                "ORDER BY r.id DESC LIMIT ?",
+                (max(1, min(limit, 50)),),
+            ))
+
     def create_booking(
         self,
         *,
@@ -413,6 +683,7 @@ class Database:
         minimum_notice: int,
         replace_booking_id: int | None = None,
         source: str = "telegram",
+        use_bonuses: bool = False,
     ) -> BookingResult:
         if source not in {"telegram", "manual"}:
             raise ValueError("Неизвестный источник записи.")
@@ -459,22 +730,71 @@ class Database:
                     return BookingResult(False, reason="old_booking_missing")
                 conn.execute("UPDATE bookings SET status = 'rescheduled' WHERE id = ?", (replace_booking_id,))
 
+            base_price = int(service["price"])
+            referral_id: int | None = None
+            referral_discount = 0
+            bonus_used = 0
+            if replace_booking_id is not None:
+                base_price = int(previous["base_price"] or previous["price"])
+                referral_discount = int(previous["referral_discount"])
+                bonus_used = int(previous["bonus_used"])
+                referral_id = int(previous["referral_id"]) if previous["referral_id"] is not None else None
+            elif source == "telegram":
+                referral = conn.execute(
+                    "SELECT * FROM referrals WHERE referred_user_id = ? AND status = 'registered' "
+                    "AND first_booking_id IS NULL",
+                    (telegram_user_id,),
+                ).fetchone()
+                if referral:
+                    phone_used = conn.execute(
+                        "SELECT 1 FROM bookings WHERE phone = ? AND attendance_status = 'completed' LIMIT 1",
+                        (phone,),
+                    ).fetchone()
+                    if phone_used:
+                        conn.execute(
+                            "UPDATE referrals SET status = 'ineligible' WHERE id = ?",
+                            (referral["id"],),
+                        )
+                    else:
+                        referral_id = int(referral["id"])
+                        referral_discount = min(base_price * REFERRAL_PERCENT // 100, REFERRAL_MAX_REWARD)
+                if use_bonuses and referral_discount == 0:
+                    balance = self._bonus_balance(conn, telegram_user_id, now)
+                    redemption_limit = base_price * BONUS_REDEMPTION_PERCENT // 100
+                    bonus_used = min(balance, redemption_limit, base_price - referral_discount)
+
+            final_price = base_price - referral_discount - bonus_used
+
             cursor = conn.execute(
                 """
                 INSERT INTO bookings (
                     telegram_user_id, customer_name, username, phone, service_id, service_name,
-                    duration_minutes, price, work_date, start_minutes, end_minutes, created_at, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    duration_minutes, price, base_price, referral_discount, bonus_used, referral_id,
+                    work_date, start_minutes, end_minutes, created_at, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (telegram_user_id, customer_name, username, phone, service_id, service["name"],
-                 service["duration_minutes"], service["price"], work_date.isoformat(), start_minutes,
-                 end_minutes, now.isoformat(), source),
+                 service["duration_minutes"], final_price, base_price, referral_discount, bonus_used,
+                 referral_id, work_date.isoformat(), start_minutes, end_minutes, now.isoformat(), source),
             )
+            booking_id = int(cursor.lastrowid)
+            if replace_booking_id is not None:
+                conn.execute("UPDATE bonus_usages SET booking_id = ? WHERE booking_id = ?", (booking_id, replace_booking_id))
+                if referral_id is not None:
+                    conn.execute("UPDATE referrals SET first_booking_id = ? WHERE id = ?", (booking_id, referral_id))
+            else:
+                if bonus_used:
+                    self._consume_bonuses(conn, telegram_user_id, booking_id, bonus_used, now)
+                if referral_id is not None:
+                    conn.execute(
+                        "UPDATE referrals SET first_booking_id = ?, status = 'booked' WHERE id = ?",
+                        (booking_id, referral_id),
+                    )
             conn.execute(
                 "INSERT OR REPLACE INTO customer_profiles(telegram_user_id, full_name, username, phone) VALUES (?, ?, ?, ?)",
                 (telegram_user_id, customer_name, username, phone),
             )
-            return BookingResult(True, booking_id=int(cursor.lastrowid))
+            return BookingResult(True, booking_id=booking_id)
 
     def booking(self, booking_id: int) -> sqlite3.Row | None:
         with self.connect() as conn:
@@ -563,6 +883,7 @@ class Database:
 
     def cancel_booking(self, booking_id: int, user_id: int | None = None) -> bool:
         with self.connect() as conn:
+            now = datetime.now().astimezone()
             if user_id is None:
                 cursor = conn.execute(
                     "UPDATE bookings SET status = 'cancelled' WHERE id = ? AND status = 'confirmed' "
@@ -575,16 +896,56 @@ class Database:
                     "AND status = 'confirmed' AND attendance_status NOT IN ('completed', 'no_show')",
                     (booking_id, user_id),
                 )
+            if cursor.rowcount > 0:
+                self._refund_bonuses(conn, booking_id, now)
+                conn.execute(
+                    "UPDATE referrals SET first_booking_id = NULL, status = 'registered' "
+                    "WHERE first_booking_id = ? AND status != 'completed'",
+                    (booking_id,),
+                )
             return cursor.rowcount > 0
 
-    def update_attendance_status(self, booking_id: int, attendance_status: str) -> bool:
+    def update_attendance_status(
+        self,
+        booking_id: int,
+        attendance_status: str,
+        now: datetime | None = None,
+    ) -> bool:
         if attendance_status not in ATTENDANCE_STATUSES:
             raise ValueError("Неизвестный статус записи.")
         with self.connect() as conn:
+            effective_now = now or datetime.now().astimezone()
             cursor = conn.execute(
                 "UPDATE bookings SET attendance_status = ? WHERE id = ? AND status = 'confirmed'",
                 (attendance_status, booking_id),
             )
+            if cursor.rowcount > 0 and attendance_status == "no_show":
+                self._refund_bonuses(conn, booking_id, effective_now)
+                conn.execute(
+                    "UPDATE referrals SET first_booking_id = NULL, status = 'registered' "
+                    "WHERE first_booking_id = ? AND status != 'completed'",
+                    (booking_id,),
+                )
+            if cursor.rowcount > 0 and attendance_status == "completed":
+                booking = conn.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,)).fetchone()
+                if booking and booking["referral_id"] is not None:
+                    referral = conn.execute(
+                        "SELECT * FROM referrals WHERE id = ? AND status != 'completed'",
+                        (booking["referral_id"],),
+                    ).fetchone()
+                    if referral:
+                        reward = min(int(booking["base_price"]) * REFERRAL_PERCENT // 100, REFERRAL_MAX_REWARD)
+                        conn.execute(
+                            "UPDATE referrals SET status = 'completed', reward_amount = ?, completed_at = ? WHERE id = ?",
+                            (reward, effective_now.isoformat(), referral["id"]),
+                        )
+                        conn.execute(
+                            "INSERT OR IGNORE INTO bonus_rewards(telegram_user_id, referral_id, amount, "
+                            "remaining_amount, earned_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            (referral["referrer_user_id"], referral["id"], reward, reward,
+                             effective_now.isoformat(),
+                             (effective_now + timedelta(days=BONUS_EXPIRY_DAYS)).isoformat()),
+                        )
             return cursor.rowcount > 0
 
     def profile(self, user_id: int) -> sqlite3.Row | None:
