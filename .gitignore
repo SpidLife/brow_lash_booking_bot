@@ -1,0 +1,18 @@
+# Секретные настройки
+.env
+.env.*
+!.env.example
+
+# База клиентов
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Логи и временные файлы
+*.log
+__pycache__/
+*.py[cod]
+
+# Системные файлы macOS
+.DS_Store
