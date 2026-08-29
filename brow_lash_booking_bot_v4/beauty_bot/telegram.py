@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -15,6 +16,7 @@ class TelegramAPIError(RuntimeError):
 
 class TelegramAPI:
     def __init__(self, token: str):
+        self.token = token
         self.base_url = f"https://api.telegram.org/bot{token}/"
 
     def call(self, method: str, **payload: Any) -> Any:
@@ -41,6 +43,77 @@ class TelegramAPI:
         if not result.get("ok"):
             raise TelegramAPIError(result.get("description", "Неизвестная ошибка Telegram"))
         return result.get("result")
+
+    def download_file(self, file_id: str) -> tuple[bytes, str]:
+        file_info = self.call("getFile", file_id=file_id)
+        file_path = str(file_info.get("file_path", "")) if file_info else ""
+        if not file_path:
+            raise TelegramAPIError("Telegram не вернул путь к фотографии.")
+        request = Request(f"https://api.telegram.org/file/bot{self.token}/{file_path}", method="GET")
+        try:
+            with urlopen(request, timeout=30) as response:
+                return response.read(), file_path.rsplit("/", 1)[-1]
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise TelegramAPIError(f"Не удалось загрузить фотографию из Telegram: {exc}") from exc
+
+    def call_multipart(
+        self,
+        method: str,
+        fields: dict[str, str],
+        file_field: str,
+        filename: str,
+        content: bytes,
+        content_type: str,
+    ) -> Any:
+        boundary = f"----BeautyBot{uuid.uuid4().hex}"
+        chunks: list[bytes] = []
+        for name, value in fields.items():
+            chunks.extend([
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                value.encode("utf-8"),
+                b"\r\n",
+            ])
+        chunks.extend([
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'.encode(),
+            f"Content-Type: {content_type}\r\n\r\n".encode(),
+            content,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode(),
+        ])
+        request = Request(
+            self.base_url + method,
+            data=b"".join(chunks),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=45) as response:
+                result = json.load(response)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            try:
+                description = json.loads(body).get("description", "Telegram вернул ошибку")
+            except json.JSONDecodeError:
+                description = f"HTTP {exc.code}"
+            raise TelegramAPIError(description) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise TelegramAPIError(f"Проблема соединения с Telegram: {exc}") from exc
+        if not result.get("ok"):
+            raise TelegramAPIError(result.get("description", "Неизвестная ошибка Telegram"))
+        return result.get("result")
+
+    def set_profile_photo_from_file_id(self, file_id: str) -> Any:
+        content, filename = self.download_file(file_id)
+        return self.call_multipart(
+            "setMyProfilePhoto",
+            {"photo": json.dumps({"type": "static", "photo": "attach://avatar"})},
+            "avatar",
+            filename if filename.lower().endswith((".jpg", ".jpeg")) else "avatar.jpg",
+            content,
+            "image/jpeg",
+        )
 
     def send(self, chat_id: int, text: str, keyboard: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", **extra}
