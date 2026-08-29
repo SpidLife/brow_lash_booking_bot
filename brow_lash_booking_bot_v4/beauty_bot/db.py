@@ -200,6 +200,22 @@ class Database:
                     amount INTEGER NOT NULL CHECK(amount > 0),
                     PRIMARY KEY(usage_id, reward_id)
                 );
+                CREATE TABLE IF NOT EXISTS analytics_users (
+                    user_hash TEXT PRIMARY KEY,
+                    first_seen_at TEXT NOT NULL,
+                    first_seen_date TEXT NOT NULL,
+                    known_before_tracking INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS analytics_activity (
+                    activity_date TEXT NOT NULL,
+                    user_hash TEXT NOT NULL,
+                    launch_count INTEGER NOT NULL DEFAULT 0,
+                    booking_count INTEGER NOT NULL DEFAULT 0,
+                    referral_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(activity_date, user_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_analytics_activity_user
+                    ON analytics_activity(user_hash, activity_date);
                 """
             )
             self._migrate(conn)
@@ -656,6 +672,96 @@ class Database:
             "ineligible": ineligible,
             "rewards": int(referrals["rewards"]),
             "balance": int(balance["balance"]),
+        }
+
+    def record_analytics_event(
+        self,
+        user_hash: str,
+        event: str,
+        occurred_at: datetime,
+        known_before_tracking: bool = False,
+    ) -> None:
+        if event not in {"launch", "booking", "referral"}:
+            raise ValueError("Неизвестное событие статистики.")
+        if not user_hash:
+            raise ValueError("Пустой обезличенный идентификатор.")
+        activity_date = occurred_at.date().isoformat()
+        column = {
+            "launch": "launch_count",
+            "booking": "booking_count",
+            "referral": "referral_count",
+        }[event]
+        with self.connect() as conn:
+            if event == "launch":
+                conn.execute(
+                    "INSERT OR IGNORE INTO analytics_users("
+                    "user_hash, first_seen_at, first_seen_date, known_before_tracking) "
+                    "VALUES (?, ?, ?, ?)",
+                    (user_hash, occurred_at.isoformat(), activity_date, int(known_before_tracking)),
+                )
+            conn.execute(
+                f"INSERT INTO analytics_activity(activity_date, user_hash, {column}) VALUES (?, ?, 1) "
+                f"ON CONFLICT(activity_date, user_hash) DO UPDATE SET {column} = {column} + 1",
+                (activity_date, user_hash),
+            )
+
+    def analytics_secret(self) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT setting_value FROM studio_settings WHERE setting_key = 'analytics_secret'"
+            ).fetchone()
+            if row and row["setting_value"]:
+                return str(row["setting_value"])
+            value = secrets.token_hex(32)
+            conn.execute(
+                "INSERT OR REPLACE INTO studio_settings(setting_key, setting_value) VALUES ('analytics_secret', ?)",
+                (value,),
+            )
+            return value
+
+    def analytics_stats(self, start_date: date, end_date: date) -> dict[str, int | str | None]:
+        if end_date <= start_date:
+            raise ValueError("Конец периода должен быть позже начала.")
+        start_value = start_date.isoformat()
+        end_value = end_date.isoformat()
+        with self.connect() as conn:
+            visitors = int(conn.execute(
+                "SELECT COUNT(DISTINCT user_hash) total FROM analytics_activity "
+                "WHERE activity_date >= ? AND activity_date < ? AND launch_count > 0",
+                (start_value, end_value),
+            ).fetchone()["total"])
+            new_users = int(conn.execute(
+                "SELECT COUNT(*) total FROM analytics_users u "
+                "WHERE u.known_before_tracking = 0 "
+                "AND u.first_seen_date >= ? AND u.first_seen_date < ? "
+                "AND EXISTS (SELECT 1 FROM analytics_activity a WHERE a.user_hash = u.user_hash "
+                "AND a.activity_date >= ? AND a.activity_date < ? AND a.launch_count > 0)",
+                (start_value, end_value, start_value, end_value),
+            ).fetchone()["total"])
+            booked = int(conn.execute(
+                "SELECT COUNT(DISTINCT a.user_hash) total FROM analytics_activity a "
+                "WHERE a.activity_date >= ? AND a.activity_date < ? AND a.booking_count > 0 "
+                "AND EXISTS (SELECT 1 FROM analytics_activity launches "
+                "WHERE launches.user_hash = a.user_hash AND launches.activity_date >= ? "
+                "AND launches.activity_date < ? AND launches.launch_count > 0)",
+                (start_value, end_value, start_value, end_value),
+            ).fetchone()["total"])
+            referred = int(conn.execute(
+                "SELECT COUNT(DISTINCT user_hash) total FROM analytics_activity "
+                "WHERE activity_date >= ? AND activity_date < ? AND referral_count > 0",
+                (start_value, end_value),
+            ).fetchone()["total"])
+            tracking_row = conn.execute(
+                "SELECT MIN(first_seen_date) tracking_since FROM analytics_users"
+            ).fetchone()
+        return {
+            "visitors": visitors,
+            "new_users": new_users,
+            "returning_users": max(0, visitors - new_users),
+            "booked": booked,
+            "referred": referred,
+            "conversion": round(booked * 100 / visitors) if visitors else 0,
+            "tracking_since": tracking_row["tracking_since"] if tracking_row else None,
         }
 
     def recent_referrals(self, limit: int = 10) -> list[sqlite3.Row]:
