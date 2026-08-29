@@ -95,6 +95,9 @@ class BeautyBot:
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.settings.admin_ids
 
+    def can_manage_bot(self, user_id: int) -> bool:
+        return self.is_admin(user_id) or user_id in self.settings.bot_manager_ids
+
     @property
     def client_minimum_notice_minutes(self) -> int:
         return max(120, self.settings.minimum_notice_minutes)
@@ -124,7 +127,12 @@ class BeautyBot:
 
     def main_keyboard(self, user_id: int) -> dict[str, Any]:
         if self.is_admin(user_id):
-            return reply_keyboard(["📋 Показать меню", "✏️ Изменить"], ["📚 Все записи"])
+            return reply_keyboard(
+                ["📋 Показать меню", "✏️ Изменить"],
+                ["📚 Все записи", "⚙️ Настройки бота"],
+            )
+        if self.can_manage_bot(user_id):
+            return reply_keyboard(["📋 Показать меню", "⚙️ Настройки бота"])
         return reply_keyboard(["📋 Показать меню"])
 
     def home_keyboard(self, user_id: int) -> dict[str, Any]:
@@ -205,8 +213,8 @@ class BeautyBot:
         self.api.call("deleteWebhook", drop_pending_updates=False)
         self.api.call("deleteMyCommands")
         self.api.call("deleteMyCommands", scope={"type": "all_private_chats"})
-        for admin_id in self.settings.admin_ids:
-            self.configure_chat_commands(admin_id)
+        for privileged_id in self.settings.admin_ids | self.settings.bot_manager_ids:
+            self.configure_chat_commands(privileged_id)
         logger.info("Бот @%s запущен", identity.get("username", "unknown"))
         offset: int | None = None
         retry_delay = 1
@@ -247,6 +255,17 @@ class BeautyBot:
                     commands=[
                         {"command": "start", "description": "Открыть главное меню"},
                         {"command": "admin", "description": "Управление для мастера"},
+                        {"command": "cancel", "description": "Отменить текущий ввод"},
+                    ],
+                )
+                self.api.call("setChatMenuButton", chat_id=user_id, menu_button={"type": "commands"})
+            elif self.can_manage_bot(user_id):
+                self.api.call(
+                    "setMyCommands",
+                    scope=scope,
+                    commands=[
+                        {"command": "start", "description": "Открыть главное меню"},
+                        {"command": "botsettings", "description": "Настройки профиля бота"},
                         {"command": "cancel", "description": "Отменить текущий ввод"},
                     ],
                 )
@@ -329,6 +348,10 @@ class BeautyBot:
                     self.db.clear_state(user_id)
                     self.show_admin_panel(user_id)
                     return
+                if active_state and active_state["state"].startswith("bot_") and self.can_manage_bot(user_id):
+                    self.db.clear_state(user_id)
+                    self.show_bot_settings(user_id)
+                    return
             self.show_home(user_id)
             return
 
@@ -358,13 +381,19 @@ class BeautyBot:
             self.db.clear_state(user_id)
             self.show_address(user_id)
             return
+        if text in {"⚙️ Настройки бота", "/botsettings"}:
+            if not self.can_manage_bot(user_id):
+                self.api.send(user_id, "Эта команда доступна только управляющему ботом.", self.main_keyboard(user_id))
+                return
+            self.db.clear_state(user_id)
+            self.show_bot_settings(user_id)
+            return
         if text in {"✏️ Изменить", "Изменить", "⚙️ Управление расписанием", "/admin"}:
             if not self.is_admin(user_id):
                 self.api.send(user_id, "Эта команда доступна только мастеру.", self.main_keyboard(user_id))
                 return
             self.db.clear_state(user_id)
-            panel_id = self.panel_message_ids.get(user_id) if text in {"✏️ Изменить", "Изменить"} else None
-            self.show_admin_panel(user_id, panel_id)
+            self.show_admin_panel(user_id)
             return
 
         state = self.db.state(user_id)
@@ -444,6 +473,49 @@ class BeautyBot:
             self.db.clear_state(user_id)
             self.api.send(user_id, "Спасибо! Номер сохранён. Подтверди запись ниже 👇", self.main_keyboard(user_id))
             self.show_confirmation(user_id, int(payload["service_id"]), date.fromisoformat(payload["date"]), int(payload["start"]), payload.get("replace_id"))
+            return
+
+        if state.startswith("bot_"):
+            if not self.can_manage_bot(user_id):
+                self.db.clear_state(user_id)
+                return
+            try:
+                if state == "bot_edit_name":
+                    if not text:
+                        raise ValueError("Имя не может быть пустым.")
+                    if len(text) > 64:
+                        raise ValueError("Имя бота должно быть не длиннее 64 символов.")
+                    self.api.call("setMyName", name=text)
+                    success = "✅ Имя бота обновлено."
+                elif state == "bot_edit_description":
+                    value = "" if text == "-" else text
+                    if len(value) > 512:
+                        raise ValueError("Полное описание должно быть не длиннее 512 символов.")
+                    self.api.call("setMyDescription", description=value)
+                    success = "✅ Полное описание бота обновлено."
+                elif state == "bot_edit_short_description":
+                    value = "" if text == "-" else text
+                    if len(value) > 120:
+                        raise ValueError("Короткое описание должно быть не длиннее 120 символов.")
+                    self.api.call("setMyShortDescription", short_description=value)
+                    success = "✅ Короткое описание бота обновлено."
+                elif state == "bot_edit_photo":
+                    photos = message.get("photo") or []
+                    if not photos:
+                        raise ValueError("Отправь фотографию обычным сообщением, без режима «файл».")
+                    self.api.set_profile_photo_from_file_id(str(photos[-1]["file_id"]))
+                    success = "✅ Аватар бота обновлён."
+                else:
+                    self.db.clear_state(user_id)
+                    return
+                self.db.clear_state(user_id)
+                self.api.send(user_id, success, self.main_keyboard(user_id))
+                self.show_bot_settings(user_id)
+            except (ValueError, TypeError, TelegramAPIError, AttributeError) as exc:
+                self.api.send(
+                    user_id,
+                    f"Не получилось сохранить: {escape(str(exc))}\n\nПопробуй ещё раз или отправь /cancel.",
+                )
             return
 
         if not self.is_admin(user_id):
@@ -1025,6 +1097,39 @@ class BeautyBot:
             sent = self.api.send(user_id, text, keyboard)
             if sent.get("message_id"):
                 self.panel_message_ids[user_id] = int(sent["message_id"])
+
+    def show_bot_settings(self, user_id: int, message_id: int | None = None) -> None:
+        if not self.can_manage_bot(user_id):
+            self.api.send(user_id, "Настройки профиля бота доступны только управляющему.")
+            return
+        try:
+            name_result = self.api.call("getMyName")
+            description_result = self.api.call("getMyDescription")
+            short_result = self.api.call("getMyShortDescription")
+            name = str(name_result.get("name", "")) if isinstance(name_result, dict) else ""
+            description = str(description_result.get("description", "")) if isinstance(description_result, dict) else ""
+            short_description = str(short_result.get("short_description", "")) if isinstance(short_result, dict) else ""
+        except (TelegramAPIError, AttributeError):
+            logger.warning("Не удалось получить настройки профиля бота", exc_info=True)
+            name = self.settings.studio_name
+            description = "Не удалось загрузить"
+            short_description = "Не удалось загрузить"
+        text = (
+            "⚙️ <b>Настройки профиля бота</b>\n\n"
+            f"<b>Имя:</b> {escape(name or 'не задано')}\n"
+            f"<b>Короткое описание:</b> {escape(short_description or 'не задано')}\n"
+            f"<b>Полное описание:</b> {escape(description or 'не задано')}\n\n"
+            "Изменения применяются к профилю бота в Telegram. Доступа к записям клиентов здесь нет."
+        )
+        keyboard = inline(
+            [("✏️ Изменить имя", "bset:name")],
+            [("📝 Полное описание", "bset:description")],
+            [("💬 Короткое описание", "bset:short_description")],
+            [("🖼 Заменить аватар", "bset:photo")],
+            [("🗑 Удалить аватар", "bphotoclearask")],
+            [("← В главное меню", "home")],
+        )
+        self.show_panel(user_id, text, keyboard, message_id)
 
     def show_admin_referrals(self, user_id: int, message_id: int | None = None) -> None:
         stats = self.db.referral_stats()
@@ -1626,10 +1731,55 @@ class BeautyBot:
         if action.startswith("a") and action not in {"appointments", "address"} and not self.is_admin(user_id):
             self.api.send(user_id, "Управление расписанием доступно только мастеру.")
             return
+        if action in {"bsettings", "bset", "bphotoclearask", "bphotoclear"} and not self.can_manage_bot(user_id):
+            self.api.send(user_id, "Настройки профиля бота доступны только управляющему.")
+            return
 
         try:
             if action == "home":
                 self.show_home(user_id, message_id)
+            elif action == "bsettings":
+                self.db.clear_state(user_id)
+                self.show_bot_settings(user_id, message_id)
+            elif action == "bset":
+                field = parts[1]
+                prompts = {
+                    "name": (
+                        "bot_edit_name",
+                        "✏️ <b>Новое имя бота</b>\n\nОтправь имя одним сообщением. Максимум 64 символа.",
+                    ),
+                    "description": (
+                        "bot_edit_description",
+                        "📝 <b>Полное описание бота</b>\n\nОтправь новый текст одним сообщением, максимум 512 символов. Чтобы удалить описание, отправь один знак минуса: -",
+                    ),
+                    "short_description": (
+                        "bot_edit_short_description",
+                        "💬 <b>Короткое описание бота</b>\n\nОтправь новый текст одним сообщением, максимум 120 символов. Чтобы удалить описание, отправь один знак минуса: -",
+                    ),
+                    "photo": (
+                        "bot_edit_photo",
+                        "🖼 <b>Новый аватар бота</b>\n\nОтправь квадратную фотографию обычным фото, не как файл.",
+                    ),
+                }
+                if field not in prompts:
+                    raise ValueError("Неизвестная настройка")
+                state, prompt = prompts[field]
+                self.db.set_state(user_id, state)
+                self.show_panel(user_id, prompt, inline([("← Назад", "bsettings")]), message_id)
+            elif action == "bphotoclearask":
+                self.show_panel(
+                    user_id,
+                    "🗑 <b>Удалить текущий аватар бота?</b>\n\nВернуть его можно будет только повторной загрузкой фотографии.",
+                    inline(
+                        [("Да, удалить", "bphotoclear")],
+                        [("← Не удалять", "bsettings")],
+                    ),
+                    message_id,
+                )
+            elif action == "bphotoclear":
+                self.api.call("removeMyProfilePhoto")
+                self.api.send(user_id, "✅ Аватар бота удалён.", self.main_keyboard(user_id))
+                self.show_bot_settings(user_id, message_id)
             elif action == "appointments":
                 self.db.clear_state(user_id)
                 self.show_my_bookings(user_id, int(parts[1]) if len(parts) > 1 else 0, message_id)
@@ -1738,7 +1888,7 @@ class BeautyBot:
                         self.api.send(user_id, f"До процедуры осталось слишком мало времени. Для переноса напиши мастеру: {escape(self.settings.contact)}")
             else:
                 self.handle_admin_callback(user_id, parts, message_id)
-        except (ValueError, IndexError, TypeError):
+        except (ValueError, IndexError, TypeError, TelegramAPIError, AttributeError):
             logger.warning("Некорректные данные кнопки: %s", data, exc_info=True)
             self.api.send(user_id, "Эта кнопка устарела. Открой меню и попробуй ещё раз.", self.main_keyboard(user_id))
 
