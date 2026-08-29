@@ -7,15 +7,31 @@ import time as time_module
 from datetime import date, datetime, timedelta
 from html import escape
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 if __package__:
     from .config import Settings
-    from .db import Database, hhmm_to_minutes, minutes_to_hhmm
+    from .db import (
+        BONUS_EXPIRY_DAYS,
+        BONUS_REDEMPTION_PERCENT,
+        REFERRAL_MAX_REWARD,
+        REFERRAL_PERCENT,
+        Database,
+        hhmm_to_minutes,
+        minutes_to_hhmm,
+    )
     from .telegram import TelegramAPI, TelegramAPIError, inline, reply_keyboard
 else:
     from config import Settings
-    from db import Database, hhmm_to_minutes, minutes_to_hhmm
+    from db import (
+        BONUS_EXPIRY_DAYS,
+        BONUS_REDEMPTION_PERCENT,
+        REFERRAL_MAX_REWARD,
+        REFERRAL_PERCENT,
+        Database,
+        hhmm_to_minutes,
+        minutes_to_hhmm,
+    )
     from telegram import TelegramAPI, TelegramAPIError, inline, reply_keyboard
 
 logger = logging.getLogger(__name__)
@@ -71,6 +87,7 @@ class BeautyBot:
         self.api = api or TelegramAPI(settings.bot_token)
         self.last_reminder_check = 0.0
         self.panel_message_ids: dict[int, int] = {}
+        self.bot_username = ""
 
     def now(self) -> datetime:
         return datetime.now(self.settings.timezone)
@@ -78,8 +95,21 @@ class BeautyBot:
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.settings.admin_ids
 
+    @property
+    def client_minimum_notice_minutes(self) -> int:
+        return max(120, self.settings.minimum_notice_minutes)
+
     def studio_address(self) -> str:
         return self.db.studio_setting("address", self.settings.address)
+
+    def studio_address_link(self) -> str:
+        address = self.studio_address().strip()
+        visible_address = address if address.endswith((".", "!", "?")) else address + "."
+        map_url = self.settings.map_url.strip()
+        normalized_address = address.lower().replace("ул.", "улица ")
+        if not map_url or "университетская" not in normalized_address or "25/2" not in normalized_address:
+            return escape(visible_address)
+        return f'<a href="{escape(map_url, quote=True)}">{escape(visible_address)}</a>'
 
     def telegram_contact_link(self) -> str:
         contact = self.settings.contact
@@ -103,6 +133,7 @@ class BeautyBot:
             [("💅 Услуги и цены", "prices")],
             [("📍 Адрес и контакты", "address")],
             [("📸 Фото работ", "portfolio"), ("💬 Написать мастеру", "support")],
+            [("🎁 Пригласить подругу", "referral")],
         ]
         return inline(*rows)
 
@@ -142,7 +173,7 @@ class BeautyBot:
 
     def show_address(self, user_id: int, message_id: int | None = None) -> None:
         details = (
-            f"📍 <b>Адрес:</b> {escape(self.studio_address())}\n"
+            f"📍 <b>Адрес:</b> {self.studio_address_link()}\n"
             f"👩‍🎨 <b>Мастер:</b> {escape(self.settings.master_name)}\n"
             f"💬 <b>Telegram:</b> {self.telegram_contact_link()}\n"
             f"📸 <b>Instagram:</b> {self.instagram_link()}"
@@ -170,19 +201,12 @@ class BeautyBot:
 
     def run(self) -> None:
         identity = self.api.call("getMe")
+        self.bot_username = str(identity.get("username", ""))
         self.api.call("deleteWebhook", drop_pending_updates=False)
-        self.api.call(
-            "setMyCommands",
-            commands=[
-                {"command": "start", "description": "Открыть главное меню"},
-                {"command": "book", "description": "Записаться на процедуру"},
-                {"command": "appointments", "description": "Посмотреть мои записи"},
-                {"command": "contact", "description": "Написать мастеру"},
-                {"command": "portfolio", "description": "Посмотреть фотографии работ"},
-                {"command": "admin", "description": "Управление для мастера"},
-                {"command": "cancel", "description": "Отменить текущий ввод"},
-            ],
-        )
+        self.api.call("deleteMyCommands")
+        self.api.call("deleteMyCommands", scope={"type": "all_private_chats"})
+        for admin_id in self.settings.admin_ids:
+            self.configure_chat_commands(admin_id)
         logger.info("Бот @%s запущен", identity.get("username", "unknown"))
         offset: int | None = None
         retry_delay = 1
@@ -211,6 +235,28 @@ class BeautyBot:
                 time_module.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 30)
 
+    def configure_chat_commands(self, user_id: int) -> None:
+        if not hasattr(self.api, "call"):
+            return
+        scope = {"type": "chat", "chat_id": user_id}
+        try:
+            if self.is_admin(user_id):
+                self.api.call(
+                    "setMyCommands",
+                    scope=scope,
+                    commands=[
+                        {"command": "start", "description": "Открыть главное меню"},
+                        {"command": "admin", "description": "Управление для мастера"},
+                        {"command": "cancel", "description": "Отменить текущий ввод"},
+                    ],
+                )
+                self.api.call("setChatMenuButton", chat_id=user_id, menu_button={"type": "commands"})
+            else:
+                self.api.call("deleteMyCommands", scope=scope)
+                self.api.call("setChatMenuButton", chat_id=user_id, menu_button={"type": "default"})
+        except (TelegramAPIError, AttributeError):
+            logger.warning("Не удалось обновить меню команд для %s", user_id, exc_info=True)
+
     def handle_update(self, update: dict[str, Any]) -> None:
         if "message" in update:
             self.handle_message(update["message"])
@@ -228,11 +274,26 @@ class BeautyBot:
         self.db.save_profile(user_id, name, username)
         text = (message.get("text") or "").strip()
 
-        if text == "/start":
+        if text == "/start" or text.startswith("/start "):
             self.db.clear_state(user_id)
+            referral_result = ""
+            start_parts = text.split(maxsplit=1)
+            if len(start_parts) == 2 and start_parts[1].startswith("ref_"):
+                referral_result = self.db.register_referral_code(start_parts[1][4:], user_id, self.now())
+            self.configure_chat_commands(user_id)
+            ready_text = "✨ Панель готова. Пользуйся кнопками внизу 👇"
+            if referral_result == "registered":
+                ready_text = (
+                    f"🎁 Тебя пригласила подруга! На первый выполненный визит действует скидка "
+                    f"{REFERRAL_PERCENT}%, максимум {REFERRAL_MAX_REWARD} {self.settings.currency}."
+                )
+            elif referral_result == "self":
+                ready_text = "Свою пригласительную ссылку использовать нельзя. Главное меню открыто 👇"
+            elif referral_result == "existing_customer":
+                ready_text = "Приглашение действует только для новых клиенток. Главное меню открыто 👇"
             self.api.send(
                 user_id,
-                "✨ Панель готова. Пользуйся кнопками внизу 👇",
+                ready_text,
                 self.main_keyboard(user_id),
             )
             self.show_home(user_id)
@@ -285,6 +346,10 @@ class BeautyBot:
         if text in {"📸 Фото работ", "/portfolio"}:
             self.db.clear_state(user_id)
             self.show_portfolio(user_id)
+            return
+        if text in {"🎁 Пригласить подругу", "/referral"}:
+            self.db.clear_state(user_id)
+            self.show_referral(user_id)
             return
         if text in {"💬 Связаться с мастером", "/contact"}:
             self.request_master_contact(user_id)
@@ -611,6 +676,62 @@ class BeautyBot:
         else:
             self.api.send_photo(user_id, str(photo["file_id"]), text, keyboard)
 
+    def referral_link(self, user_id: int) -> str:
+        if not self.bot_username and hasattr(self.api, "call"):
+            try:
+                identity = self.api.call("getMe")
+                self.bot_username = str(identity.get("username", ""))
+            except (TelegramAPIError, AttributeError):
+                logger.warning("Не удалось получить имя бота для реферальной ссылки", exc_info=True)
+        if not self.bot_username:
+            return ""
+        code = self.db.referral_code(user_id, self.now())
+        return f"https://t.me/{self.bot_username}?start=ref_{code}"
+
+    def show_referral(self, user_id: int, message_id: int | None = None) -> None:
+        balance = self.db.bonus_balance(user_id, self.now())
+        invited = self.db.referrals_by_referrer(user_id)
+        completed = sum(row["status"] == "completed" for row in invited)
+        pending = len(invited) - completed
+        lines = [
+            "🎁 <b>Пригласи подругу</b>\n",
+            f"Подруга получит скидку <b>{REFERRAL_PERCENT}%</b> на первый визит, "
+            f"но не более {REFERRAL_MAX_REWARD} {escape(self.settings.currency)}.",
+            f"После её выполненного визита тебе начислится столько же бонусов. "
+            f"Ими можно оплатить до <b>{BONUS_REDEMPTION_PERCENT}%</b> следующей процедуры.",
+            f"Бонусы действуют {BONUS_EXPIRY_DAYS // 30} месяцев и не суммируются с другими акциями.\n",
+            f"💰 <b>Твой баланс: {balance} бонусов</b>",
+            f"👭 Приглашено: {len(invited)} · выполнили визит: {completed} · ожидаются: {pending}",
+        ]
+        if invited:
+            lines.append("\n<b>Последние приглашения:</b>")
+            for row in invited[:5]:
+                name = escape(row["referred_name"] or "Новая клиентка")
+                status = {
+                    "registered": "открыла бота",
+                    "booked": "записалась",
+                    "completed": f"визит выполнен · +{row['reward_amount']}",
+                    "ineligible": "не подходит под условия",
+                }.get(str(row["status"]), str(row["status"]))
+                lines.append(f"• {name} — {status}")
+
+        rows: list[list[dict[str, str]]] = []
+        link = self.referral_link(user_id)
+        if self.db.referral_enabled() and link:
+            share_text = (
+                f"Привет! Приглашаю тебя к мастеру {self.settings.master_name}. "
+                f"По моей ссылке будет скидка {REFERRAL_PERCENT}% на первый визит 👇"
+            )
+            share_url = f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(share_text, safe='')}"
+            lines.extend(["", "<b>Твоя личная ссылка:</b>", f"<code>{escape(link)}</code>"])
+            rows.append([{"text": "📤 Отправить подруге", "url": share_url}])
+        elif not self.db.referral_enabled():
+            lines.extend(["", "Новые приглашения временно приостановлены мастером. Уже заработанные бонусы сохраняются."])
+        else:
+            lines.extend(["", "Ссылка появится после перезапуска бота."])
+        rows.append([{"text": "← Назад", "callback_data": "home"}])
+        self.show_panel(user_id, "\n".join(lines), {"inline_keyboard": rows}, message_id)
+
     def show_dates(self, user_id: int, service_id: int, page: int = 0, message_id: int | None = None, replace_id: int | None = None) -> None:
         service = self.db.service(service_id)
         if not service:
@@ -625,7 +746,7 @@ class BeautyBot:
             work_date = now.date() + timedelta(days=day_offset)
             slots = self.db.available_slots(
                 work_date, int(service["duration_minutes"]), self.settings.slot_step_minutes,
-                now, self.settings.minimum_notice_minutes, replace_id,
+                now, self.client_minimum_notice_minutes, replace_id,
             )
             if slots:
                 date_code = work_date.strftime("%Y%m%d")
@@ -658,7 +779,7 @@ class BeautyBot:
             return
         slots = self.db.available_slots(
             work_date, int(service["duration_minutes"]), self.settings.slot_step_minutes,
-            self.now(), self.settings.minimum_notice_minutes, replace_id,
+            self.now(), self.client_minimum_notice_minutes, replace_id,
         )
         code = work_date.strftime("%Y%m%d")
         suffix = f":{replace_id}" if replace_id is not None else ""
@@ -710,34 +831,73 @@ class BeautyBot:
         start: int,
         replace_id: int | None = None,
         message_id: int | None = None,
+        use_bonuses: bool = False,
     ) -> None:
         service = self.db.service(service_id)
         profile = self.db.profile(user_id)
         if not service or not profile:
             self.show_services(user_id, True)
             return
-        suffix = f":{replace_id}" if replace_id is not None else ""
+        replace_token = replace_id or 0
         code = work_date.strftime("%Y%m%d")
+        base_price = int(service["price"])
+        previous = self.db.booking(replace_id) if replace_id is not None else None
+        if previous:
+            base_price = int(previous["base_price"] or previous["price"])
+            referral_discount = int(previous["referral_discount"])
+            bonus_used = int(previous["bonus_used"])
+            available_bonus = 0
+        else:
+            referral_discount = self.db.referral_discount_preview(user_id, base_price)
+            available_bonus = self.db.bonus_redemption_preview(user_id, base_price, referral_discount, self.now())
+            bonus_used = available_bonus if use_bonuses else 0
+        final_price = base_price - referral_discount - bonus_used
+        price_lines = [f"💳 Стоимость: {base_price} {escape(self.settings.currency)}"]
+        if referral_discount:
+            price_lines.append(f"🎉 Скидка новой клиентке: −{referral_discount} {escape(self.settings.currency)}")
+        if bonus_used:
+            price_lines.append(f"🎁 Списывается бонусами: −{bonus_used} {escape(self.settings.currency)}")
+        if referral_discount or bonus_used:
+            price_lines.append(f"<b>К оплате: {final_price} {escape(self.settings.currency)}</b>")
+        price_text = "\n".join(price_lines)
         text = (
             "💛 <b>Проверь свою запись</b>\n\n"
             f"💅 {escape(service['name'])}\n"
             f"🗓 {pretty_date(work_date)} в {minutes_to_hhmm(start)}\n"
             f"⏱ {duration_label(int(service['duration_minutes']))}\n"
-            f"💳 {service['price']} {escape(self.settings.currency)}\n"
+            f"{price_text}\n"
             f"📱 {escape(profile['phone'])}\n"
-            f"📍 {escape(self.studio_address())}\n\n"
+            f"📍 {self.studio_address_link()}\n\n"
             "Если всё правильно, нажми «Подтвердить»."
         )
-        keyboard = inline(
-            [("✅ Подтвердить", f"confirm:{service_id}:{code}:{start}{suffix}")],
-            [("← Изменить время", f"day:{service_id}:{code}{suffix}")],
-        )
+        rows: list[list[tuple[str, str]]] = []
+        if available_bonus:
+            if use_bonuses:
+                rows.append([("Не списывать бонусы", f"bonusoff:{service_id}:{code}:{start}:{replace_token}")])
+            else:
+                rows.append([(
+                    f"🎁 Списать {available_bonus} бонусов",
+                    f"bonuson:{service_id}:{code}:{start}:{replace_token}",
+                )])
+        rows.extend([
+            [("✅ Подтвердить", f"confirm:{service_id}:{code}:{start}:{replace_token}:{int(use_bonuses)}")],
+            [("← Изменить время", f"day:{service_id}:{code}" + (f":{replace_id}" if replace_id else ""))],
+        ])
+        keyboard = inline(*rows)
         if message_id:
             self.api.edit(user_id, message_id, text, keyboard)
         else:
             self.api.send(user_id, text, keyboard)
 
-    def complete_booking(self, user_id: int, service_id: int, work_date: date, start: int, replace_id: int | None = None) -> None:
+    def complete_booking(
+        self,
+        user_id: int,
+        service_id: int,
+        work_date: date,
+        start: int,
+        replace_id: int | None = None,
+        use_bonuses: bool = False,
+    ) -> None:
         profile = self.db.profile(user_id)
         if not profile or not profile["phone"]:
             self.request_phone_or_confirmation(user_id, service_id, work_date, start, replace_id)
@@ -751,8 +911,9 @@ class BeautyBot:
             work_date=work_date,
             start_minutes=start,
             now=self.now(),
-            minimum_notice=self.settings.minimum_notice_minutes,
+            minimum_notice=self.client_minimum_notice_minutes,
             replace_booking_id=replace_id,
+            use_bonuses=use_bonuses,
         )
         if not result.ok or result.booking_id is None:
             self.api.send(user_id, "😔 Это время уже недоступно. Я покажу актуальные свободные окна.", self.main_keyboard(user_id))
@@ -779,12 +940,24 @@ class BeautyBot:
 
     def booking_summary(self, booking: Any) -> str:
         work_date = date.fromisoformat(booking["work_date"])
+        base_price = int(booking["base_price"] or booking["price"])
+        referral_discount = int(booking["referral_discount"])
+        bonus_used = int(booking["bonus_used"])
+        price_lines = [f"💳 {booking['price']} {escape(self.settings.currency)}"]
+        if referral_discount or bonus_used:
+            price_lines = [f"💳 К оплате: <b>{booking['price']} {escape(self.settings.currency)}</b>"]
+            price_lines.append(f"Обычная стоимость: {base_price} {escape(self.settings.currency)}")
+            if referral_discount:
+                price_lines.append(f"🎉 Скидка по приглашению: −{referral_discount} {escape(self.settings.currency)}")
+            if bonus_used:
+                price_lines.append(f"🎁 Оплачено бонусами: −{bonus_used} {escape(self.settings.currency)}")
+        price_text = "\n".join(price_lines)
         return (
             f"💅 {escape(booking['service_name'])}\n"
             f"🗓 {pretty_date(work_date)} в {minutes_to_hhmm(int(booking['start_minutes']))}\n"
             f"⏱ {duration_label(int(booking['duration_minutes']))}\n"
-            f"💳 {booking['price']} {escape(self.settings.currency)}\n"
-            f"📍 {escape(self.studio_address())}"
+            f"{price_text}\n"
+            f"📍 {self.studio_address_link()}"
         )
 
     def show_my_bookings(self, user_id: int, page: int = 0, message_id: int | None = None) -> None:
@@ -839,6 +1012,7 @@ class BeautyBot:
             [("📆 Выбрать день", "acal:0")],
             [("🕒 График по дням недели", "aweek")],
             [("💅 Услуги и цены", "aservices")],
+            [("🎁 Реферальная программа", "areferrals")],
             [("📸 Фотографии работ", "aportfolio")],
             [("📍 Адрес и фото входа", "aaddress")],
             [("📊 Сводка на сегодня", "adigest:0"), ("📊 На завтра", "adigest:1")],
@@ -851,6 +1025,44 @@ class BeautyBot:
             sent = self.api.send(user_id, text, keyboard)
             if sent.get("message_id"):
                 self.panel_message_ids[user_id] = int(sent["message_id"])
+
+    def show_admin_referrals(self, user_id: int, message_id: int | None = None) -> None:
+        stats = self.db.referral_stats()
+        enabled = self.db.referral_enabled()
+        lines = [
+            "🎁 <b>Реферальная программа</b>\n",
+            f"Статус: {'🟢 принимает новые приглашения' if enabled else '⏸ новые приглашения приостановлены'}",
+            f"Новой клиентке: {REFERRAL_PERCENT}%, максимум {REFERRAL_MAX_REWARD} {escape(self.settings.currency)}",
+            f"Пригласившей: {REFERRAL_PERCENT}% бонусами после выполненного визита",
+            f"Списание: до {BONUS_REDEMPTION_PERCENT}% процедуры · срок: {BONUS_EXPIRY_DAYS // 30} месяцев\n",
+            f"👭 Всего приглашений: {stats['total']}",
+            f"💚 Выполненных первых визитов: {stats['completed']}",
+            f"🕒 Ожидаются: {stats['pending']}",
+            f"⚪️ Не подошли под условия: {stats['ineligible']}",
+            f"🎁 Начислено бонусов: {stats['rewards']}",
+            f"💰 Осталось на балансах: {stats['balance']}",
+        ]
+        recent = self.db.recent_referrals()
+        if recent:
+            lines.append("\n<b>Последние приглашения:</b>")
+            for row in recent:
+                inviter = escape(row["referrer_name"] or f"ID {row['referrer_user_id']}")
+                friend = escape(row["referred_name"] or f"ID {row['referred_user_id']}")
+                status = {
+                    "registered": "открыла бота",
+                    "booked": "записалась",
+                    "completed": f"выполнено · {row['reward_amount']} бонусов",
+                    "ineligible": "не подходит под условия",
+                }.get(str(row["status"]), str(row["status"]))
+                lines.append(f"• {inviter} → {friend}: {status}")
+        keyboard = inline(
+            [(
+                "⏸ Приостановить новые приглашения" if enabled else "▶️ Возобновить приглашения",
+                "areftoggle",
+            )],
+            [("← В панель мастера", "admin")],
+        )
+        self.show_panel(user_id, "\n".join(lines), keyboard, message_id)
 
     def journal_period(self, period: str) -> tuple[date | None, date | None, str]:
         today = self.now().date()
@@ -1195,7 +1407,7 @@ class BeautyBot:
         has_photo = bool(self.db.studio_setting("entrance_photo_file_id"))
         text = (
             "📍 <b>Адрес и фотография входа</b>\n\n"
-            f"Адрес: {escape(self.studio_address())}\n"
+            f"Адрес: {self.studio_address_link()}\n"
             f"Фото входа: {'добавлено ✅' if has_photo else 'не добавлено'}\n\n"
             "Клиент увидит адрес и фотографию в разделе «Адрес и контакты»."
         )
@@ -1433,6 +1645,9 @@ class BeautyBot:
             elif action == "portfolio":
                 self.db.clear_state(user_id)
                 self.show_portfolio(user_id, int(parts[1]) if len(parts) > 1 else 0, message_id)
+            elif action == "referral":
+                self.db.clear_state(user_id)
+                self.show_referral(user_id, message_id)
             elif action == "svc":
                 self.show_service_card(user_id, int(parts[1]), message_id)
             elif action == "svcdates":
@@ -1450,8 +1665,28 @@ class BeautyBot:
                     int(parts[4]) if len(parts) > 4 else None,
                     message_id,
                 )
+            elif action in {"bonuson", "bonusoff"}:
+                replace_id = int(parts[4]) or None
+                self.show_confirmation(
+                    user_id,
+                    int(parts[1]),
+                    self.decode_date(parts[2]),
+                    int(parts[3]),
+                    replace_id,
+                    message_id,
+                    action == "bonuson",
+                )
             elif action == "confirm":
-                self.complete_booking(user_id, int(parts[1]), self.decode_date(parts[2]), int(parts[3]), int(parts[4]) if len(parts) > 4 else None)
+                replace_id = (int(parts[4]) or None) if len(parts) > 4 else None
+                use_bonuses = len(parts) > 5 and parts[5] == "1"
+                self.complete_booking(
+                    user_id,
+                    int(parts[1]),
+                    self.decode_date(parts[2]),
+                    int(parts[3]),
+                    replace_id,
+                    use_bonuses,
+                )
             elif action == "visitok":
                 booking = self.db.booking(int(parts[1]))
                 if booking and int(booking["telegram_user_id"]) == user_id and self.db.update_attendance_status(int(parts[1]), "client_confirmed"):
@@ -1517,7 +1752,7 @@ class BeautyBot:
         action = parts[0]
         if action in {
             "admin", "aweek", "aday", "asvc", "aservices", "aportfolio", "aaddress", "amday", "amanual",
-            "ajournal", "ajcalendar", "ajdetail",
+            "ajournal", "ajcalendar", "ajdetail", "areferrals",
         }:
             self.db.clear_state(user_id)
         if action == "admin":
@@ -1534,10 +1769,36 @@ class BeautyBot:
             self.show_admin_booking(user_id, int(parts[1]), message_id)
         elif action == "astatus":
             booking_id = int(parts[1])
-            if self.db.update_attendance_status(booking_id, parts[2]):
+            booking_before = self.db.booking(booking_id)
+            referral_before = (
+                self.db.referral(int(booking_before["referral_id"]))
+                if booking_before and booking_before["referral_id"] is not None
+                else None
+            )
+            if self.db.update_attendance_status(booking_id, parts[2], self.now()):
                 self.show_admin_booking(user_id, booking_id, message_id)
+                if (
+                    parts[2] == "completed"
+                    and referral_before
+                    and referral_before["status"] != "completed"
+                ):
+                    referral_after = self.db.referral(int(referral_before["id"]))
+                    if referral_after:
+                        self.safe_notify(
+                            int(referral_after["referrer_user_id"]),
+                            f"🎉 Подруга завершила первый визит! Тебе начислено "
+                            f"<b>{referral_after['reward_amount']} бонусов</b>.\n\n"
+                            f"Ими можно оплатить до {BONUS_REDEMPTION_PERCENT}% следующей процедуры. "
+                            f"Посмотреть баланс можно в разделе «Пригласить подругу».",
+                            inline([("🎁 Посмотреть баланс", "referral")]),
+                        )
             else:
                 self.api.send(user_id, "Не удалось изменить статус этой записи.")
+        elif action == "areferrals":
+            self.show_admin_referrals(user_id, message_id)
+        elif action == "areftoggle":
+            self.db.set_referral_enabled(not self.db.referral_enabled())
+            self.show_admin_referrals(user_id, message_id)
         elif action == "adigest":
             offset = int(parts[1])
             label = "Сегодня" if offset == 0 else "Завтра"
