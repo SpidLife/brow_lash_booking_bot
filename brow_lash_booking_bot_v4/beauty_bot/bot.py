@@ -213,9 +213,8 @@ class BeautyBot:
 
     def show_address(self, user_id: int, message_id: int | None = None) -> None:
         details = (
-            f"📍 <b>Адрес:</b> {self.studio_address_link()}\n"
-            f"👩‍🎨 <b>Мастер:</b> {escape(self.settings.master_name)}\n"
-            f"💬 <b>Telegram:</b> {self.telegram_contact_link()}\n"
+            f"📍 <b>Адрес:</b> {self.studio_address_link()}\n\n"
+            f"💬 <b>Telegram:</b> {self.telegram_contact_link()}\n\n"
             f"📸 <b>Instagram:</b> {self.instagram_link()}"
         )
         entrance_photo = self.db.studio_setting("entrance_photo_file_id")
